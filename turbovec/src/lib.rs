@@ -63,7 +63,7 @@ pub use error::{AddError, ConstructError, FromPartsError};
 pub use id_map::IdMapIndex;
 
 use std::path::Path;
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 
 const ROTATION_SEED: u64 = 42;
 const BLOCK: usize = 32;
@@ -166,6 +166,7 @@ pub struct TurboQuantIndex {
     boundaries: OnceLock<Vec<f32>>,
     centroids: OnceLock<Vec<f32>>,
     blocked: OnceLock<BlockedCache>,
+    cache_dirty: Mutex<RuntimeCacheDirty>,
 }
 
 /// Top-`k` results for a batch of queries, as returned by
@@ -211,6 +212,12 @@ impl SearchResults {
     }
 }
 
+#[derive(Debug)]
+enum RuntimeCacheDirty {
+    AppendOnly,
+    Blocks(Vec<usize>),
+}
+
 impl TurboQuantIndex {
     /// Construct an index with a known dimensionality. The dim is locked
     /// at construction; subsequent [`Self::add`] / [`Self::add_2d`] calls
@@ -242,6 +249,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            cache_dirty: Mutex::new(RuntimeCacheDirty::AppendOnly),
         })
     }
 
@@ -267,6 +275,7 @@ impl TurboQuantIndex {
             boundaries: OnceLock::new(),
             centroids: OnceLock::new(),
             blocked: OnceLock::new(),
+            cache_dirty: Mutex::new(RuntimeCacheDirty::AppendOnly),
         })
     }
 
@@ -531,10 +540,9 @@ impl TurboQuantIndex {
         let rotation = self
             .rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        let centroids = self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        let centroids = self
+            .centroids
+            .get_or_init(|| codebook::codebook(self.bit_width, dim).1);
         let blocked = self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
@@ -611,10 +619,8 @@ impl TurboQuantIndex {
         }
         self.rotation
             .get_or_init(|| rotation::make_rotation_matrix(dim));
-        self.centroids.get_or_init(|| {
-            let (_, c) = codebook::codebook(self.bit_width, dim);
-            c
-        });
+        self.centroids
+            .get_or_init(|| codebook::codebook(self.bit_width, dim).1);
         self.blocked.get_or_init(|| {
             let (data, n_blocks) =
                 pack::repack(&self.packed_codes, self.n_vectors, self.bit_width, dim);
@@ -628,7 +634,7 @@ impl TurboQuantIndex {
         // freshly-constructed lazy state. dim=0 is otherwise meaningless
         // (the constructor asserts dim % 8 == 0 with dim >= 8), so this
         // doesn't collide with any valid eager index.
-        io::write_with_fingerprint(
+        io::write_with_cache_mode(
             path,
             self.bit_width,
             self.dim.unwrap_or(0),
@@ -638,7 +644,10 @@ impl TurboQuantIndex {
             &self.tqplus_shift,
             &self.tqplus_scale,
             self.rotation_fingerprint(),
-        )
+            self.runtime_cache_mode(),
+        )?;
+        self.mark_runtime_cache_written();
+        Ok(())
     }
 
     /// Serialize the index in the `.tv` byte format to any
@@ -711,8 +720,8 @@ impl TurboQuantIndex {
     }
 
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (parts, rot) = io::load_with_rotation(path)?;
-        Self::from_loaded(parts, rot)
+        let (parts, rot, runtime_cache) = io::load_with_cache(path)?;
+        Self::from_loaded_with_cache(parts, rot, runtime_cache)
     }
 
     /// Shared tail of [`Self::load`] / [`Self::load_from_reader`]:
@@ -723,12 +732,17 @@ impl TurboQuantIndex {
         parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>),
         rot: Option<Vec<f32>>,
     ) -> std::io::Result<Self> {
+        Self::from_loaded_with_cache(parts, rot, None)
+    }
+
+    fn from_loaded_with_cache(
+        parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>),
+        rot: Option<Vec<f32>>,
+        runtime_cache: Option<io::RuntimeCache>,
+    ) -> std::io::Result<Self> {
         let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        // The io layer already validates the payload at the read layer, so
-        // from_parts should always succeed here; surface any residual
-        // inconsistency as InvalidData rather than panicking.
-        let index = Self::from_parts(
+        let index = Self::from_parts_with_cache(
             dim_opt,
             bit_width,
             n_vectors,
@@ -736,6 +750,7 @@ impl TurboQuantIndex {
             scales,
             tqplus_shift,
             tqplus_scale,
+            runtime_cache,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         index.seed_rotation(rot);
@@ -855,6 +870,28 @@ impl TurboQuantIndex {
         tqplus_shift: Vec<f32>,
         tqplus_scale: Vec<f32>,
     ) -> Result<Self, FromPartsError> {
+        Self::from_parts_with_cache(
+            dim,
+            bit_width,
+            n_vectors,
+            packed_codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+            None,
+        )
+    }
+
+    pub(crate) fn from_parts_with_cache(
+        dim: Option<usize>,
+        bit_width: usize,
+        n_vectors: usize,
+        packed_codes: Vec<u8>,
+        scales: Vec<f32>,
+        tqplus_shift: Vec<f32>,
+        tqplus_scale: Vec<f32>,
+        runtime_cache: Option<io::RuntimeCache>,
+    ) -> Result<Self, FromPartsError> {
         // bit_width gates the codebook level count (`1 << bit_width`); a
         // value outside {2,3,4} is both meaningless and — via the raw
         // codebook — an unbounded-allocation hazard. Check it first.
@@ -877,7 +914,10 @@ impl TurboQuantIndex {
                     return Err(FromPartsError::DimNotPositiveMultipleOf8(d));
                 }
                 if d > MAX_DIM {
-                    return Err(FromPartsError::DimTooLarge { dim: d, max: MAX_DIM });
+                    return Err(FromPartsError::DimTooLarge {
+                        dim: d,
+                        max: MAX_DIM,
+                    });
                 }
                 // Checked arithmetic, mirroring io::read_header_codes_scales:
                 // `n_vectors` is caller-controlled, so the product can
@@ -985,6 +1025,21 @@ impl TurboQuantIndex {
         } else {
             (tqplus_shift, tqplus_scale)
         };
+
+        let rotation = OnceLock::new();
+        let boundaries = OnceLock::new();
+        let centroids = OnceLock::new();
+        let blocked = OnceLock::new();
+
+        if let Some(cache) = runtime_cache {
+            let _ = rotation.set(cache.rotation);
+            let _ = boundaries.set(cache.boundaries);
+            let _ = centroids.set(cache.centroids);
+            let _ = blocked.set(BlockedCache {
+                data: cache.blocked_data,
+                n_blocks: cache.n_blocks,
+            });
+        }
         Ok(Self {
             dim,
             bit_width,
@@ -993,10 +1048,11 @@ impl TurboQuantIndex {
             scales,
             tqplus_shift,
             tqplus_scale,
-            rotation: OnceLock::new(),
-            boundaries: OnceLock::new(),
-            centroids: OnceLock::new(),
-            blocked: OnceLock::new(),
+            rotation,
+            boundaries,
+            centroids,
+            blocked,
+            cache_dirty: Mutex::new(RuntimeCacheDirty::AppendOnly),
         })
     }
 
@@ -1064,6 +1120,8 @@ impl TurboQuantIndex {
 
         // Invalidate the blocked cache since it was derived from the old layout.
         self.blocked = OnceLock::new();
+        self.mark_runtime_cache_dirty(idx / BLOCK);
+        self.mark_runtime_cache_dirty(last / BLOCK);
 
         last
     }
@@ -1094,6 +1152,40 @@ impl TurboQuantIndex {
     pub fn bit_width(&self) -> usize {
         self.bit_width
     }
+
+    pub(crate) fn runtime_cache_mode(&self) -> io::RuntimeCacheMode {
+        match &*self
+            .cache_dirty
+            .lock()
+            .expect("runtime cache dirty lock poisoned")
+        {
+            RuntimeCacheDirty::AppendOnly => io::RuntimeCacheMode::AppendOnly,
+            RuntimeCacheDirty::Blocks(blocks) => io::RuntimeCacheMode::DirtyBlocks(blocks.clone()),
+        }
+    }
+
+    pub(crate) fn mark_runtime_cache_written(&self) {
+        *self
+            .cache_dirty
+            .lock()
+            .expect("runtime cache dirty lock poisoned") = RuntimeCacheDirty::AppendOnly;
+    }
+
+    fn mark_runtime_cache_dirty(&self, block: usize) {
+        let mut dirty = self
+            .cache_dirty
+            .lock()
+            .expect("runtime cache dirty lock poisoned");
+        match &mut *dirty {
+            RuntimeCacheDirty::AppendOnly => {
+                *dirty = RuntimeCacheDirty::Blocks(vec![block]);
+            }
+            RuntimeCacheDirty::Blocks(blocks) => match blocks.binary_search(&block) {
+                Ok(_) => {}
+                Err(pos) => blocks.insert(pos, block),
+            },
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1123,22 +1215,18 @@ mod from_parts_tests {
         .unwrap_err();
         assert!(matches!(
             err,
-            FromPartsError::PackedCodesLengthMismatch { expected: 64, got: 32 }
+            FromPartsError::PackedCodesLengthMismatch {
+                expected: 64,
+                got: 32
+            }
         ));
     }
 
     #[test]
     fn from_parts_rejects_lazy_with_nonzero_n_vectors() {
-        let err = TurboQuantIndex::from_parts(
-            None,
-            4,
-            5,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap_err();
+        let err =
+            TurboQuantIndex::from_parts(None, 4, 5, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .unwrap_err();
         assert!(matches!(err, FromPartsError::LazyMustHaveZeroVectors(5)));
     }
 
@@ -1146,16 +1234,9 @@ mod from_parts_tests {
     fn from_parts_accepts_lazy_uncommitted() {
         // Lazy + everything empty + n_vectors=0 is the canonical lazy
         // state the constructor must accept.
-        let idx = TurboQuantIndex::from_parts(
-            None,
-            4,
-            0,
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-            Vec::new(),
-        )
-        .unwrap();
+        let idx =
+            TurboQuantIndex::from_parts(None, 4, 0, Vec::new(), Vec::new(), Vec::new(), Vec::new())
+                .unwrap();
         assert_eq!(idx.dim_opt(), None);
         assert_eq!(idx.len(), 0);
     }
@@ -1201,7 +1282,9 @@ mod x86_scalar_fallback_tests {
         for row in out.chunks_mut(dim) {
             let mut norm = 0.0f64;
             for x in row.iter_mut() {
-                s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+                s = s
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
                 let v = ((s >> 33) as f64 / (1u64 << 31) as f64) - 1.0;
                 *x = v as f32;
                 norm += v * v;

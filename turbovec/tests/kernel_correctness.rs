@@ -256,11 +256,7 @@ fn search_is_deterministic_for_same_query() {
             "non-deterministic indices at n={}",
             n
         );
-        assert_eq!(
-            r1.scores, r2.scores,
-            "non-deterministic scores at n={}",
-            n
-        );
+        assert_eq!(r1.scores, r2.scores, "non-deterministic scores at n={}", n);
     }
 }
 

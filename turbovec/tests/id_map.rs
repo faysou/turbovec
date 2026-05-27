@@ -119,9 +119,9 @@ fn remaining_ids_still_self_query_after_mixed_removes() {
 
     // Remove a few ids in different orders — some will trigger
     // swap-and-pop, some will be the last vector (no swap).
-    idx.remove(ids[7]);   // middle
-    idx.remove(ids[19]);  // last
-    idx.remove(ids[0]);   // first
+    idx.remove(ids[7]); // middle
+    idx.remove(ids[19]); // last
+    idx.remove(ids[0]); // first
 
     assert_eq!(idx.len(), 17);
     assert!(!idx.contains(ids[7]));
@@ -166,9 +166,7 @@ fn add_with_ids_rejects_duplicate_id() {
     let mut idx = IdMapIndex::new(dim, 4).unwrap();
     idx.add_with_ids(&data[..2 * dim], &[1, 2]).unwrap();
     // Same id "2" already present.
-    let err = idx
-        .add_with_ids(&data[2 * dim..3 * dim], &[2])
-        .unwrap_err();
+    let err = idx.add_with_ids(&data[2 * dim..3 * dim], &[2]).unwrap_err();
     assert_eq!(err, turbovec::AddError::IdAlreadyPresent(2));
 }
 
@@ -290,7 +288,6 @@ fn add_with_ids_2d_rolls_back_id_tables_on_inner_dim_mismatch() {
     assert!(idx.contains(40));
     assert!(idx.contains(50));
 }
-
 
 // ---- IdMapIndex audit-driven coverage ----
 
@@ -416,7 +413,7 @@ fn remove_keeps_swapped_id_addressable_in_both_tables() {
 
     // Both tables must reflect the swap: contains() and search() agree.
     assert!(idx.contains(505));
-    let q = &data[4 * dim..5 * dim];  // the vector that used to be at slot 4
+    let q = &data[4 * dim..5 * dim]; // the vector that used to be at slot 4
     let (_, got_ids) = idx.search(q, 1);
     assert_eq!(got_ids[0], 505);
     // The moved id is now at slot 1, and the original slot-1 vector
@@ -452,10 +449,8 @@ fn empty_index_round_trip() {
     let dim = 128;
     let idx = IdMapIndex::new(dim, 4).unwrap();
 
-    let tmp = std::env::temp_dir().join(format!(
-        "turbovec_idmap_empty_{}.tvim",
-        std::process::id()
-    ));
+    let tmp =
+        std::env::temp_dir().join(format!("turbovec_idmap_empty_{}.tvim", std::process::id()));
     idx.write(&tmp).expect("write failed");
 
     let restored = IdMapIndex::load(&tmp).expect("load failed");
@@ -463,4 +458,168 @@ fn empty_index_round_trip() {
     assert_eq!(restored.dim(), dim);
     assert_eq!(restored.bit_width(), 4);
     std::fs::remove_file(&tmp).ok();
+}
+
+#[test]
+fn append_writes_runtime_cache_by_tail_block() {
+    let dim = 16;
+    let mut idx = IdMapIndex::new(dim, 2).unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_idmap_append_cache_{}.tvim",
+        std::process::id()
+    ));
+    let cache = runtime_cache_path(&tmp);
+
+    let ids_31: Vec<u64> = (0..31).collect();
+    idx.add_with_ids_2d(&gaussian_normalized(31, dim, 0xCACE_0001), dim, &ids_31)
+        .unwrap();
+    idx.write(&tmp).unwrap();
+    let header_31 = read_runtime_cache_header(&cache);
+    let len_31 = cache.metadata().unwrap().len();
+    let tvim_len_31 = tmp.metadata().unwrap().len();
+    assert_eq!(header_31.n_vectors, 31);
+    assert_eq!(header_31.n_blocks, 1);
+
+    idx.add_with_ids_2d(&gaussian_normalized(1, dim, 0xCACE_0002), dim, &[31])
+        .unwrap();
+    idx.write(&tmp).unwrap();
+    let header_32 = read_runtime_cache_header(&cache);
+    let len_32 = cache.metadata().unwrap().len();
+    let tvim_len_32 = tmp.metadata().unwrap().len();
+    assert_eq!(header_32.n_vectors, 32);
+    assert_eq!(header_32.n_blocks, 1);
+    assert_eq!(len_32, len_31);
+    assert_eq!(tvim_len_32 - tvim_len_31, 16);
+
+    idx.add_with_ids_2d(&gaussian_normalized(1, dim, 0xCACE_0003), dim, &[32])
+        .unwrap();
+    idx.write(&tmp).unwrap();
+    let header_33 = read_runtime_cache_header(&cache);
+    let len_33 = cache.metadata().unwrap().len();
+    let tvim_len_33 = tmp.metadata().unwrap().len();
+    assert_eq!(header_33.n_vectors, 33);
+    assert_eq!(header_33.n_blocks, 2);
+    assert_eq!(len_33 - len_32, (dim / (8 / 2) * 32) as u64);
+    assert_eq!(tvim_len_33 - tvim_len_32, 16);
+
+    let restored = IdMapIndex::load(&tmp).unwrap();
+    assert_eq!(restored.len(), 33);
+    assert!(restored.contains(32));
+
+    std::fs::remove_file(cache).ok();
+    std::fs::remove_file(tmp).ok();
+}
+
+#[test]
+fn swap_remove_updates_runtime_cache_dirty_blocks() {
+    let dim = 16;
+    let mut idx = IdMapIndex::new(dim, 2).unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_idmap_remove_cache_{}.tvim",
+        std::process::id()
+    ));
+    let cache = runtime_cache_path(&tmp);
+
+    let ids: Vec<u64> = (0..65).collect();
+    idx.add_with_ids_2d(&gaussian_normalized(65, dim, 0xCACE_1001), dim, &ids)
+        .unwrap();
+    idx.write(&tmp).unwrap();
+    let header_65 = read_runtime_cache_header(&cache);
+    let len_65 = cache.metadata().unwrap().len();
+    let tvim_len_65 = tmp.metadata().unwrap().len();
+    assert_eq!(header_65.n_vectors, 65);
+    assert_eq!(header_65.n_blocks, 3);
+
+    assert!(idx.remove(0));
+    idx.write(&tmp).unwrap();
+    let header_64 = read_runtime_cache_header(&cache);
+    let len_64 = cache.metadata().unwrap().len();
+    let tvim_len_64 = tmp.metadata().unwrap().len();
+    assert_eq!(header_64.n_vectors, 64);
+    assert_eq!(header_64.n_blocks, 2);
+    assert_eq!(len_65 - len_64, (dim / (8 / 2) * 32) as u64);
+    assert_eq!(tvim_len_65 - tvim_len_64, 16);
+
+    let restored = IdMapIndex::load(&tmp).unwrap();
+    assert_eq!(restored.len(), 64);
+    assert!(!restored.contains(0));
+    assert!(restored.contains(64));
+
+    std::fs::remove_file(cache).ok();
+    std::fs::remove_file(tmp).ok();
+}
+
+#[test]
+fn multiple_swap_removes_patch_runtime_cache_dirty_block_set() {
+    let dim = 16;
+    let mut idx = IdMapIndex::new(dim, 2).unwrap();
+    let tmp = std::env::temp_dir().join(format!(
+        "turbovec_idmap_many_remove_cache_{}.tvim",
+        std::process::id()
+    ));
+    let cache = runtime_cache_path(&tmp);
+
+    let ids: Vec<u64> = (0..130).collect();
+    idx.add_with_ids_2d(&gaussian_normalized(130, dim, 0xCACE_2001), dim, &ids)
+        .unwrap();
+    idx.write(&tmp).unwrap();
+
+    assert!(idx.remove(0));
+    assert!(idx.remove(40));
+    assert!(idx.remove(80));
+    idx.write(&tmp).unwrap();
+
+    let header = read_runtime_cache_header(&cache);
+    assert_eq!(header.n_vectors, 127);
+    assert_eq!(header.n_blocks, 4);
+
+    let restored = IdMapIndex::load(&tmp).unwrap();
+    assert_eq!(restored.len(), 127);
+    assert!(!restored.contains(0));
+    assert!(!restored.contains(40));
+    assert!(!restored.contains(80));
+    assert!(restored.contains(129));
+
+    std::fs::remove_file(cache).ok();
+    std::fs::remove_file(tmp).ok();
+}
+
+struct CacheHeader {
+    n_vectors: usize,
+    n_blocks: usize,
+}
+
+fn runtime_cache_path(path: &std::path::Path) -> std::path::PathBuf {
+    let mut file_name = path.file_name().unwrap().to_os_string();
+    file_name.push(".");
+    file_name.push(runtime_cache_backend_suffix());
+    file_name.push(".cache");
+    path.with_file_name(file_name)
+}
+
+fn read_runtime_cache_header(path: &std::path::Path) -> CacheHeader {
+    let bytes = std::fs::read(path).unwrap();
+    assert_eq!(&bytes[..4], b"TVRC");
+    assert_eq!(bytes[4], 1);
+    let n_vectors = u64::from_le_bytes(bytes[35..43].try_into().unwrap()) as usize;
+    let n_blocks = u64::from_le_bytes(bytes[67..75].try_into().unwrap()) as usize;
+    CacheHeader {
+        n_vectors,
+        n_blocks,
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_cache_backend_suffix() -> &'static str {
+    "x86_64-faiss-v1"
+}
+
+#[cfg(target_arch = "aarch64")]
+fn runtime_cache_backend_suffix() -> &'static str {
+    "aarch64-neon-v1"
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn runtime_cache_backend_suffix() -> &'static str {
+    "scalar-v1"
 }

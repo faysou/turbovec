@@ -226,9 +226,7 @@ impl IdMapIndex {
             mask
         });
 
-        let res = self
-            .inner
-            .search_with_mask(queries, k, mask_buf.as_deref());
+        let res = self.inner.search_with_mask(queries, k, mask_buf.as_deref());
 
         let mut ids = Vec::with_capacity(res.indices.len());
         for &slot in &res.indices {
@@ -283,7 +281,7 @@ impl IdMapIndex {
     /// id-map side-tables. Round-trips exactly through [`Self::load`].
     pub fn write(&self, path: impl AsRef<Path>) -> std::io::Result<()> {
         // Mirror TurboQuantIndex::write: dim=0 means lazy-uninitialized.
-        io::write_id_map_with_fingerprint(
+        io::write_id_map_with_cache_mode(
             path,
             self.inner.bit_width(),
             self.inner.dim_opt().unwrap_or(0),
@@ -294,13 +292,16 @@ impl IdMapIndex {
             self.inner.tqplus_scale(),
             &self.slot_to_id,
             self.inner.rotation_fingerprint(),
-        )
+            self.inner.runtime_cache_mode(),
+        )?;
+        self.inner.mark_runtime_cache_written();
+        Ok(())
     }
 
     /// Load a `.tvim` file previously written by [`Self::write`].
     pub fn load(path: impl AsRef<Path>) -> std::io::Result<Self> {
-        let (parts, rot) = io::load_id_map_with_rotation(path)?;
-        Self::from_loaded(parts, rot)
+        let (parts, rot, runtime_cache) = io::load_id_map_with_cache(path)?;
+        Self::from_loaded_with_cache(parts, rot, runtime_cache)
     }
 
     /// Serialize the index in the `.tvim` byte format to any
@@ -362,14 +363,56 @@ impl IdMapIndex {
     /// drift-verified rotation.
     #[allow(clippy::type_complexity)]
     fn from_loaded(
-        parts: (usize, usize, usize, Vec<u8>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<u64>),
+        parts: (
+            usize,
+            usize,
+            usize,
+            Vec<u8>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<u64>,
+        ),
         rot: Option<Vec<f32>>,
     ) -> std::io::Result<Self> {
-        let (bit_width, dim, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale, slot_to_id) =
-            parts;
+        Self::from_loaded_with_cache(parts, rot, None)
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn from_loaded_with_cache(
+        parts: (
+            usize,
+            usize,
+            usize,
+            Vec<u8>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<f32>,
+            Vec<u64>,
+        ),
+        rot: Option<Vec<f32>>,
+        runtime_cache: Option<io::RuntimeCache>,
+    ) -> std::io::Result<Self> {
+        let (
+            bit_width,
+            dim,
+            n_vectors,
+            packed_codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+            slot_to_id,
+        ) = parts;
         let dim_opt = if dim == 0 { None } else { Some(dim) };
-        let inner = TurboQuantIndex::from_parts(
-            dim_opt, bit_width, n_vectors, packed_codes, scales, tqplus_shift, tqplus_scale,
+        let inner = TurboQuantIndex::from_parts_with_cache(
+            dim_opt,
+            bit_width,
+            n_vectors,
+            packed_codes,
+            scales,
+            tqplus_shift,
+            tqplus_scale,
+            runtime_cache,
         )
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
         inner.seed_rotation(rot);

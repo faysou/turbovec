@@ -212,7 +212,10 @@ fn multi_query_batch_respects_mask() {
         }
         // Scores are returned in descending order.
         for w in scores_row.windows(2) {
-            assert!(w[0] >= w[1], "query {qi}: scores not descending: {scores_row:?}");
+            assert!(
+                w[0] >= w[1],
+                "query {qi}: scores not descending: {scores_row:?}"
+            );
         }
         // The fused 4-query NEON kernel and the single-query tail kernel
         // produce scores that match within float rounding (~1e-4 relative).
@@ -306,7 +309,7 @@ fn block_skip_at_one_percent_selectivity_matches_post_filter() {
     // the top-k returned by the masked path equals the top-k returned
     // by a full dense scan + post-hoc filter.
     let dim = 128;
-    let n = 4096;  // 128 blocks of 32 — gives the skip path plenty to skip
+    let n = 4096; // 128 blocks of 32 — gives the skip path plenty to skip
     let data = gaussian_normalized(n, dim, 0xB10C_5417);
     let mut idx = TurboQuantIndex::new(dim, 4).unwrap();
     idx.add(&data);
@@ -351,7 +354,9 @@ fn block_skip_at_one_percent_selectivity_matches_post_filter() {
         assert!(
             (masked_scores[i] - exp_score).abs() < 1e-4,
             "rank {}: score mismatch (got {}, want {})",
-            i, masked_scores[i], exp_score
+            i,
+            masked_scores[i],
+            exp_score
         );
     }
 }

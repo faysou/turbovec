@@ -12,7 +12,7 @@ use crate::BLOCK;
 /// Crate-internal: trusts `2 <= bits <= 4`, `dim` a multiple of 8, and
 /// `packed_codes.len() == n_vectors * (dim/8) * bits`. A raw caller passing
 /// `bits == 0` divides by zero and a short `packed_codes` reads out of
-/// bounds — construct through
+/// bounds. Construct through
 /// [`from_parts`](crate::TurboQuantIndex::from_parts) instead, which
 /// validates these before the blocked layout is ever built.
 pub(crate) fn repack(
@@ -21,71 +21,68 @@ pub(crate) fn repack(
     bits: usize,
     dim: usize,
 ) -> (Vec<u8>, usize) {
-    let bytes_per_plane = dim / 8;
-    let codes_per_byte = 8 / bits;
-    let n_byte_groups = dim / codes_per_byte;
     let n_blocks = (n_vectors + BLOCK - 1) / BLOCK;
-    let blocked_size = n_blocks * n_byte_groups * BLOCK;
-    let bytes_per_row = bits * bytes_per_plane;
-
-    let perm0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
-
-    // Step 1: Extract packed nibble bytes per vector per group
-    let mut codes_flat = vec![vec![0u8; n_byte_groups]; n_vectors];
-    for vec_idx in 0..n_vectors {
-        for g in 0..n_byte_groups {
-            let dim_start = g * codes_per_byte;
-            let mut byte_val = 0u8;
-            for c in 0..codes_per_byte {
-                let j = dim_start + c;
-                let byte_in_plane = j / 8;
-                let bit_in_byte = 7 - (j % 8);
-                let mask = 1u8 << bit_in_byte;
-
-                let mut code = 0u8;
-                for p in 0..bits {
-                    let plane_byte = packed_codes[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane];
-                    if plane_byte & mask != 0 {
-                        code |= 1 << p;
-                    }
-                }
-
-                let shift = if bits == 3 {
-                    (codes_per_byte - 1 - c) * 4
-                } else {
-                    (codes_per_byte - 1 - c) * bits
-                };
-                byte_val |= code << shift;
-            }
-            codes_flat[vec_idx][g] = byte_val;
-        }
-    }
-
-    // Step 2: Pack into platform-specific layout
-    let blocked = pack_blocked(n_vectors, n_blocks, n_byte_groups, blocked_size, &codes_flat, &perm0);
+    let blocked = repack_block_range(packed_codes, n_vectors, bits, dim, 0, n_blocks);
     (blocked, n_blocks)
 }
 
-#[cfg(target_arch = "x86_64")]
-fn pack_blocked(
-    n: usize,
-    n_blocks: usize,
-    n_byte_groups: usize,
-    blocked_size: usize,
-    codes_flat: &[Vec<u8>],
-    perm0: &[usize; 16],
+/// Repack bit-plane codes for a contiguous block range.
+///
+/// `start_block` and `end_block` use 32-vector block indices. The returned
+/// bytes are laid out as if sliced from the full blocked layout at
+/// `start_block`.
+pub(crate) fn repack_block_range(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+    start_block: usize,
+    end_block: usize,
 ) -> Vec<u8> {
-    // FAISS layout: split each byte into hi/lo nibbles, interleave with perm0.
+    let codes_per_byte = 8 / bits;
+    let n_byte_groups = dim / codes_per_byte;
+    let n_blocks = (n_vectors + BLOCK - 1) / BLOCK;
+    let start_block = start_block.min(n_blocks);
+    let end_block = end_block.min(n_blocks);
+    if start_block >= end_block {
+        return Vec::new();
+    }
+
+    let blocked_size = (end_block - start_block) * n_byte_groups * BLOCK;
+    pack_block_range(
+        packed_codes,
+        n_vectors,
+        bits,
+        dim,
+        n_byte_groups,
+        start_block,
+        end_block,
+        blocked_size,
+    )
+}
+
+#[cfg(target_arch = "x86_64")]
+fn pack_block_range(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+    n_byte_groups: usize,
+    start_block: usize,
+    end_block: usize,
+    blocked_size: usize,
+) -> Vec<u8> {
+    let perm0: [usize; 16] = [0, 8, 1, 9, 2, 10, 3, 11, 4, 12, 5, 13, 6, 14, 7, 15];
     let mut blocked = vec![0u8; blocked_size];
-    for block_idx in 0..n_blocks {
+    for block_idx in start_block..end_block {
         let base_vec = block_idx * BLOCK;
         for g in 0..n_byte_groups {
-            let out_offset = (block_idx * n_byte_groups + g) * BLOCK;
+            let out_offset = ((block_idx - start_block) * n_byte_groups + g) * BLOCK;
             for j in 0..16 {
                 let va = base_vec + perm0[j];
                 let vb = base_vec + perm0[j] + 16;
-                let ba = if va < n { codes_flat[va][g] } else { 0 };
-                let bb = if vb < n { codes_flat[vb][g] } else { 0 };
+                let ba = packed_group_byte(packed_codes, n_vectors, bits, dim, va, g);
+                let bb = packed_group_byte(packed_codes, n_vectors, bits, dim, vb, g);
                 blocked[out_offset + j] = (ba >> 4) | ((bb >> 4) << 4);
                 blocked[out_offset + 16 + j] = (ba & 0x0F) | ((bb & 0x0F) << 4);
             }
@@ -94,31 +91,88 @@ fn pack_blocked(
     blocked
 }
 
-/// Inverse of the `perm0` permutation used by the x86 `pack_blocked`:
-/// `INV_PERM0[lane] == j` such that `perm0[j] == lane`, for `lane` in 0..16.
-// Used by the x86 scalar fallback and by the round-trip test on every arch.
-#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
-pub(crate) const INV_PERM0: [usize; 16] =
-    [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
+#[cfg(not(target_arch = "x86_64"))]
+fn pack_block_range(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+    n_byte_groups: usize,
+    start_block: usize,
+    end_block: usize,
+    blocked_size: usize,
+) -> Vec<u8> {
+    let mut blocked = vec![0u8; blocked_size];
+    for block_idx in start_block..end_block {
+        let base_vec = block_idx * BLOCK;
+        for g in 0..n_byte_groups {
+            let out_offset = ((block_idx - start_block) * n_byte_groups + g) * BLOCK;
+            for lane in 0..BLOCK {
+                let vi = base_vec + lane;
+                blocked[out_offset + lane] =
+                    packed_group_byte(packed_codes, n_vectors, bits, dim, vi, g);
+            }
+        }
+    }
+    blocked
+}
 
-/// Reconstruct the *sequential* code byte for vector `lane` (0..32) of a
-/// block group from the x86 `perm0`-interleaved hi/lo-nibble layout that the
-/// x86 [`pack_blocked`] produces. `group_off` is the byte offset of the group
-/// within `blocked` (i.e. `block_offset + g * BLOCK`).
-///
-/// The x86 SIMD kernels read that interleaved layout natively, but the scalar
-/// fallback ([`crate::search::score_query_into_heap`]) decodes one sequential
-/// byte per vector. Without this de-interleave the scalar path — taken on
-/// pre-AVX2 x86 / VMs without AVX2 — read the wrong bytes and returned
-/// silently-wrong top-k results (issue #106). The returned byte is identical
-/// to what the non-x86 sequential layout stores directly: high nibble = the
-/// vector's "hi" code, low nibble = its "lo" code.
+fn packed_group_byte(
+    packed_codes: &[u8],
+    n_vectors: usize,
+    bits: usize,
+    dim: usize,
+    vec_idx: usize,
+    group: usize,
+) -> u8 {
+    if vec_idx >= n_vectors {
+        return 0;
+    }
+
+    let bytes_per_plane = dim / 8;
+    let codes_per_byte = 8 / bits;
+    let bytes_per_row = bits * bytes_per_plane;
+    let dim_start = group * codes_per_byte;
+    let mut byte_val = 0u8;
+
+    for c in 0..codes_per_byte {
+        let j = dim_start + c;
+        let byte_in_plane = j / 8;
+        let bit_in_byte = 7 - (j % 8);
+        let mask = 1u8 << bit_in_byte;
+
+        let mut code = 0u8;
+        for p in 0..bits {
+            let plane_byte =
+                packed_codes[vec_idx * bytes_per_row + p * bytes_per_plane + byte_in_plane];
+            if plane_byte & mask != 0 {
+                code |= 1 << p;
+            }
+        }
+
+        let shift = if bits == 3 {
+            (codes_per_byte - 1 - c) * 4
+        } else {
+            (codes_per_byte - 1 - c) * bits
+        };
+        byte_val |= code << shift;
+    }
+    byte_val
+}
+
+/// Inverse of the `perm0` permutation used by the x86 blocked layout:
+/// `INV_PERM0[lane] == j` such that `perm0[j] == lane`, for `lane` in 0..16.
+#[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
+pub(crate) const INV_PERM0: [usize; 16] = [0, 2, 4, 6, 8, 10, 12, 14, 1, 3, 5, 7, 9, 11, 13, 15];
+
+/// Reconstruct the sequential code byte for vector `lane` of a block group
+/// from the x86 `perm0`-interleaved hi/lo-nibble layout.
 #[inline]
 #[cfg_attr(not(target_arch = "x86_64"), allow(dead_code))]
 pub(crate) fn deinterleave_x86_code_byte(blocked: &[u8], group_off: usize, lane: usize) -> u8 {
     let j = INV_PERM0[lane & 15];
-    let hi_plane = blocked[group_off + j]; // byte holding hi-nibbles of two vectors
-    let lo_plane = blocked[group_off + 16 + j]; // byte holding lo-nibbles
+    let hi_plane = blocked[group_off + j];
+    let lo_plane = blocked[group_off + 16 + j];
     let (hi, lo) = if lane < 16 {
         (hi_plane & 0x0F, lo_plane & 0x0F)
     } else {
@@ -127,51 +181,19 @@ pub(crate) fn deinterleave_x86_code_byte(blocked: &[u8], group_off: usize, lane:
     (hi << 4) | lo
 }
 
-#[cfg(not(target_arch = "x86_64"))]
-fn pack_blocked(
-    n: usize,
-    n_blocks: usize,
-    n_byte_groups: usize,
-    blocked_size: usize,
-    codes_flat: &[Vec<u8>],
-    _perm0: &[usize; 16],
-) -> Vec<u8> {
-    // Sequential layout: each byte stored as-is, vectors in order.
-    let mut blocked = vec![0u8; blocked_size];
-    for block_idx in 0..n_blocks {
-        let base_vec = block_idx * BLOCK;
-        for g in 0..n_byte_groups {
-            let out_offset = (block_idx * n_byte_groups + g) * BLOCK;
-            for lane in 0..BLOCK {
-                let vi = base_vec + lane;
-                if vi < n {
-                    blocked[out_offset + lane] = codes_flat[vi][g];
-                }
-            }
-        }
-    }
-    blocked
-}
-
 #[cfg(test)]
 mod tests {
     use super::{deinterleave_x86_code_byte, BLOCK};
 
-    /// Pack one 32-vector block exactly as the x86 `pack_blocked` does, then
-    /// verify `deinterleave_x86_code_byte` recovers each vector's sequential
-    /// code byte. This validates the issue-#106 scalar-fallback fix on every
-    /// architecture (including ARM, where the x86 search path can't run) by
-    /// exercising the layout math directly.
     #[test]
     fn deinterleave_x86_recovers_sequential_code_bytes() {
         let n_byte_groups = 5usize;
-        // Deterministic pseudo-random code bytes for 32 vectors.
         let mut codes_flat = vec![vec![0u8; n_byte_groups]; BLOCK];
         let mut s = 0x1234_5678u32;
-        for v in 0..BLOCK {
-            for g in 0..n_byte_groups {
+        for row in &mut codes_flat {
+            for code in row {
                 s = s.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
-                codes_flat[v][g] = (s >> 24) as u8;
+                *code = (s >> 24) as u8;
             }
         }
 

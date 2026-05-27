@@ -8,7 +8,7 @@
 //! 3. A hand-constructed version-1 `.tvim` file (TVIM magic with
 //!    version byte 1) is rejected with the upgrade-hint error.
 
-use std::fs::File;
+use std::fs::{self, File};
 use std::io::Write;
 use std::path::PathBuf;
 
@@ -24,6 +24,14 @@ fn temp_path(name: &str) -> PathBuf {
     p
 }
 
+fn runtime_cache_path(path: &std::path::Path) -> PathBuf {
+    let mut file_name = path.file_name().unwrap().to_os_string();
+    file_name.push(".");
+    file_name.push(runtime_cache_backend_suffix());
+    file_name.push(".cache");
+    path.with_file_name(file_name)
+}
+
 #[test]
 fn tv_round_trip_current_format() {
     let path = temp_path("v2.tv");
@@ -36,6 +44,8 @@ fn tv_round_trip_current_format() {
     // Round-trip with empty TQ+ calibration (identity); behaviour identical
     // to a v2 file otherwise. Separate test below covers populated calibration.
     write(&path, bit_width, dim, n_vectors, &packed, &scales, &[], &[]).unwrap();
+    let cache_path = runtime_cache_path(&path);
+    assert!(cache_path.exists());
     let (bw, d, n, p, s, shift, scale_tq) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
@@ -45,7 +55,8 @@ fn tv_round_trip_current_format() {
     assert_eq!(s, scales);
     assert!(shift.is_empty());
     assert!(scale_tq.is_empty());
-    std::fs::remove_file(&path).ok();
+    fs::remove_file(&cache_path).ok();
+    fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -59,7 +70,10 @@ fn tv_round_trip_with_tqplus_calibration() {
     let shift: Vec<f32> = (0..dim).map(|d| d as f32 * 0.01).collect();
     let scale_tq: Vec<f32> = (0..dim).map(|d| 1.0 + d as f32 * 0.02).collect();
 
-    write(&path, bit_width, dim, n_vectors, &packed, &scales, &shift, &scale_tq).unwrap();
+    write(
+        &path, bit_width, dim, n_vectors, &packed, &scales, &shift, &scale_tq,
+    )
+    .unwrap();
     let (bw, d, n, p, s, loaded_shift, loaded_scale) = load(&path).unwrap();
 
     assert_eq!(bw, bit_width);
@@ -69,7 +83,8 @@ fn tv_round_trip_with_tqplus_calibration() {
     assert_eq!(s, scales);
     assert_eq!(loaded_shift, shift);
     assert_eq!(loaded_scale, scale_tq);
-    std::fs::remove_file(&path).ok();
+    fs::remove_file(runtime_cache_path(&path)).ok();
+    fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -94,7 +109,7 @@ fn tv_v1_file_is_rejected_with_upgrade_hint() {
         "expected upgrade hint, got: {}",
         msg
     );
-    std::fs::remove_file(&path).ok();
+    fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -107,7 +122,20 @@ fn tvim_round_trip_current_format() {
     let scales = vec![0.5f32, 1.0, 1.5, 2.0];
     let ids = vec![100u64, 200, 300, 400];
 
-    write_id_map(&path, bit_width, dim, n_vectors, &packed, &scales, &[], &[], &ids).unwrap();
+    write_id_map(
+        &path,
+        bit_width,
+        dim,
+        n_vectors,
+        &packed,
+        &scales,
+        &[],
+        &[],
+        &ids,
+    )
+    .unwrap();
+    let cache_path = runtime_cache_path(&path);
+    assert!(cache_path.exists());
     let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
 
     assert_eq!(bw, bit_width);
@@ -118,7 +146,140 @@ fn tvim_round_trip_current_format() {
     assert!(shift.is_empty());
     assert!(scale_tq.is_empty());
     assert_eq!(slot_to_id, ids);
-    std::fs::remove_file(&path).ok();
+    fs::remove_file(&cache_path).ok();
+    fs::remove_file(&path).ok();
+}
+
+#[test]
+fn tvim_load_creates_missing_runtime_cache_for_existing_file() {
+    let path = temp_path("existing.tvim");
+    let bit_width = 2;
+    let dim = 16;
+    let n_vectors = 4;
+    let packed = vec![0x55u8; (dim / 8) * bit_width * n_vectors];
+    let scales = vec![0.5f32, 1.0, 1.5, 2.0];
+    let ids = vec![100u64, 200, 300, 400];
+
+    write_id_map(
+        &path,
+        bit_width,
+        dim,
+        n_vectors,
+        &packed,
+        &scales,
+        &[],
+        &[],
+        &ids,
+    )
+    .unwrap();
+    let cache_path = runtime_cache_path(&path);
+    fs::remove_file(&cache_path).unwrap();
+
+    let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
+
+    assert!(cache_path.exists());
+    assert_eq!(bw, bit_width);
+    assert_eq!(d, dim);
+    assert_eq!(n, n_vectors);
+    assert_eq!(p, packed);
+    assert_eq!(s, scales);
+    assert!(shift.is_empty());
+    assert!(scale_tq.is_empty());
+    assert_eq!(slot_to_id, ids);
+    fs::remove_file(&cache_path).ok();
+    fs::remove_file(&path).ok();
+}
+
+#[test]
+fn tvim_load_repairs_corrupt_runtime_cache_for_existing_file() {
+    let path = temp_path("corrupt-cache.tvim");
+    let bit_width = 2;
+    let dim = 16;
+    let n_vectors = 4;
+    let packed = vec![0x55u8; (dim / 8) * bit_width * n_vectors];
+    let scales = vec![0.5f32, 1.0, 1.5, 2.0];
+    let ids = vec![100u64, 200, 300, 400];
+
+    write_id_map(
+        &path,
+        bit_width,
+        dim,
+        n_vectors,
+        &packed,
+        &scales,
+        &[],
+        &[],
+        &ids,
+    )
+    .unwrap();
+    let cache_path = runtime_cache_path(&path);
+    fs::write(&cache_path, b"bad cache").unwrap();
+
+    let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
+
+    assert!(cache_path.metadata().unwrap().len() > b"bad cache".len() as u64);
+    assert_eq!(bw, bit_width);
+    assert_eq!(d, dim);
+    assert_eq!(n, n_vectors);
+    assert_eq!(p, packed);
+    assert_eq!(s, scales);
+    assert!(shift.is_empty());
+    assert!(scale_tq.is_empty());
+    assert_eq!(slot_to_id, ids);
+    fs::remove_file(&cache_path).ok();
+    fs::remove_file(&path).ok();
+}
+
+#[test]
+fn runtime_cache_path_is_backend_specific() {
+    let path = temp_path("backend.tvim");
+    let cache_path = runtime_cache_path(&path);
+    let cache_name = cache_path.file_name().unwrap().to_string_lossy();
+
+    assert!(cache_name.contains(runtime_cache_backend_suffix()));
+}
+
+#[test]
+fn tvim_load_repairs_wrong_backend_runtime_cache_for_existing_file() {
+    let path = temp_path("wrong-backend-cache.tvim");
+    let bit_width = 2;
+    let dim = 16;
+    let n_vectors = 4;
+    let packed = vec![0x55u8; (dim / 8) * bit_width * n_vectors];
+    let scales = vec![0.5f32, 1.0, 1.5, 2.0];
+    let ids = vec![100u64, 200, 300, 400];
+
+    write_id_map(
+        &path,
+        bit_width,
+        dim,
+        n_vectors,
+        &packed,
+        &scales,
+        &[],
+        &[],
+        &ids,
+    )
+    .unwrap();
+    let cache_path = runtime_cache_path(&path);
+    let mut cache_bytes = fs::read(&cache_path).unwrap();
+    cache_bytes[5] = 0;
+    fs::write(&cache_path, cache_bytes).unwrap();
+
+    let (bw, d, n, p, s, shift, scale_tq, slot_to_id) = load_id_map(&path).unwrap();
+    let repaired_cache = fs::read(&cache_path).unwrap();
+
+    assert_eq!(repaired_cache[5], runtime_cache_backend_id());
+    assert_eq!(bw, bit_width);
+    assert_eq!(d, dim);
+    assert_eq!(n, n_vectors);
+    assert_eq!(p, packed);
+    assert_eq!(s, scales);
+    assert!(shift.is_empty());
+    assert!(scale_tq.is_empty());
+    assert_eq!(slot_to_id, ids);
+    fs::remove_file(&cache_path).ok();
+    fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -145,7 +306,7 @@ fn tvim_v1_file_is_rejected_with_upgrade_hint() {
         "expected upgrade hint, got: {}",
         msg
     );
-    std::fs::remove_file(&path).ok();
+    fs::remove_file(&path).ok();
 }
 
 #[test]
@@ -184,9 +345,9 @@ fn tv_unsupported_version_errors_with_useful_message() {
     let path = temp_path("future_version.tv");
     let mut f = File::create(&path).unwrap();
     f.write_all(b"TVPI").unwrap();
-    f.write_all(&[99u8]).unwrap();  // version=99 — not 2, not 3
-    // Pad with arbitrary bytes so the read doesn't fail before the
-    // version check.
+    f.write_all(&[99u8]).unwrap(); // version=99 — not 2, not 3
+                                   // Pad with arbitrary bytes so the read doesn't fail before the
+                                   // version check.
     f.write_all(&[0u8; 64]).unwrap();
     drop(f);
 
@@ -211,7 +372,7 @@ fn tv_v3_invalid_n_calib_errors_cleanly() {
 
     let mut f = File::create(&path).unwrap();
     f.write_all(b"TVPI").unwrap();
-    f.write_all(&[3u8]).unwrap();  // version=3
+    f.write_all(&[3u8]).unwrap(); // version=3
     f.write_all(&[bit_width]).unwrap();
     f.write_all(&dim.to_le_bytes()).unwrap();
     f.write_all(&n_vectors.to_le_bytes()).unwrap();
@@ -244,11 +405,45 @@ fn tv_garbage_file_rejected_without_upgrade_hint() {
     }
     let err = load(&path).unwrap_err();
     let msg = err.to_string();
-    assert!(msg.contains("wrong magic"), "expected wrong-magic error, got: {}", msg);
+    assert!(
+        msg.contains("wrong magic"),
+        "expected wrong-magic error, got: {}",
+        msg
+    );
     assert!(
         !msg.contains("turbovec ≤ 0.4.3"),
         "should not suggest upgrade for garbage: {}",
         msg
     );
-    std::fs::remove_file(&path).ok();
+    fs::remove_file(&path).ok();
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_cache_backend_suffix() -> &'static str {
+    "x86_64-faiss-v1"
+}
+
+#[cfg(target_arch = "x86_64")]
+fn runtime_cache_backend_id() -> u8 {
+    1
+}
+
+#[cfg(target_arch = "aarch64")]
+fn runtime_cache_backend_suffix() -> &'static str {
+    "aarch64-neon-v1"
+}
+
+#[cfg(target_arch = "aarch64")]
+fn runtime_cache_backend_id() -> u8 {
+    2
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn runtime_cache_backend_suffix() -> &'static str {
+    "scalar-v1"
+}
+
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+fn runtime_cache_backend_id() -> u8 {
+    3
 }

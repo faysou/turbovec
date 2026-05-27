@@ -128,8 +128,7 @@ fn deleted_vector_no_longer_returned() {
     let indices = res.indices_for_query(0);
     assert_eq!(indices.len(), idx.len());
     assert!(
-        !indices.contains(&7i64)
-            || indices[0] != 7i64,
+        !indices.contains(&7i64) || indices[0] != 7i64,
         "deleted vector appears as top-1 after swap_remove"
     );
 }

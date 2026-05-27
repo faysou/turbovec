@@ -30,3 +30,9 @@ ndarray = { version = "0.17", features = ["blas"] }
 [target.'cfg(target_os = "linux")'.dependencies]
 ndarray = { version = "0.17", features = ["blas"] }
 
+[dev-dependencies]
+criterion = "0.5"
+
+[[bench]]
+name = "io_cache"
+harness = false
